@@ -277,12 +277,122 @@ const ADAPTERS = {
      connect.squareupsandbox.com.
   */
   pos: {
-    configured: false,
+    /* Lightspeed O-Series (Kounta) - wired July 2026, export mode.
+       Live API is plan/partner-gated, so this runs on the fallback ladder:
+       the Insights "Total Sales" card, scheduled DAILY and scoped to
+       YESTERDAY, delivered to /api/ingest?source=pos&token=... Each delivery
+       is one trading day's completed-sales count (Insights' "sales" figure;
+       voids excluded by the report itself). A dated per-day CSV (e.g. a Back
+       Office export) is also accepted, for backfill and as a better future
+       rung. ONLY the count is ever read; every dollar figure is ignored. */
+    configured: true,
     auth: null,
+    mode: 'export',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('pos'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('pos'); }
+
+    _venueYesterday() {
+      /* Australia/Brisbane is UTC+10, no DST. */
+      const now = new Date(Date.now() + 10 * 3600 * 1000);
+      now.setUTCDate(now.getUTCDate() - 1);
+      return now.toISOString().slice(0, 10);
+    },
+
+    /* If the delivery is multipart (webhook senders attach the file), pull the
+       text of the attached part; otherwise return the body as-is. */
+    _unwrap(raw) {
+      const ct = (raw.contentType || '').toLowerCase();
+      let text = raw.text || '';
+      const m = ct.match(/boundary="?([^";]+)"?/);
+      if (ct.includes('multipart') && m) {
+        const parts = text.split('--' + m[1]);
+        let best = '';
+        for (const p of parts) {
+          const idx = p.indexOf('\r\n\r\n') >= 0 ? p.indexOf('\r\n\r\n') + 4
+                    : p.indexOf('\n\n') >= 0 ? p.indexOf('\n\n') + 2 : -1;
+          if (idx < 0) continue;
+          const body = p.slice(idx).trim();
+          if (body.length > best.length) best = body;
+        }
+        if (best) text = best;
+      }
+      return text;
+    },
+
+    _toIsoDate(s) {
+      const t = String(s || '').trim().replace(/^"|"$/g, '');
+      let m = t.match(/^(\d{4})-(\d{2})-(\d{2})/);                 /* YYYY-MM-DD */
+      if (m) return m[1] + '-' + m[2] + '-' + m[3];
+      m = t.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})/);               /* DD/MM/YYYY (AU) */
+      if (m) return m[3] + '-' + m[2].padStart(2, '0') + '-' + m[1].padStart(2, '0');
+      return null;
+    },
+
+    async parseExport(env, h, raw) {
+      const text = this._unwrap(raw);
+
+      /* Shape A: a dated per-day CSV. Find rows starting with a date and a
+         column that is a plain integer count (never a $ column). Column pick:
+         prefer a header matching count-ish names; otherwise the first
+         all-integer, non-currency column. Handles Insights' two-row headers. */
+      const lines = text.split(/\r?\n/).filter((l) => l.trim() !== '');
+      const rows = lines.map((l) => l.split(',').map((c) => c.replace(/^"|"$/g, '').trim()));
+      const dataRows = rows.filter((r) => this._toIsoDate(r[0]));
+      if (dataRows.length) {
+        const headerRows = rows.slice(0, Math.max(0, rows.indexOf(dataRows[0])));
+        const nameOf = (c) => headerRows.map((hr) => hr[c] || '').join(' ').toLowerCase();
+        const isCountName = (s) => /(number of sales|sales count|sale count|count of|orders|transactions|# ?sales|no\.? of)/.test(s);
+        const colOk = (c) => dataRows.every((r) => {
+          const v = (r[c] || '').replace(/,/g, '');
+          return v === '' || /^\d+$/.test(v);   /* integers only; $ values fail */
+        });
+        let col = -1;
+        const width = Math.max(...dataRows.map((r) => r.length));
+        for (let c = 1; c < width; c++) if (isCountName(nameOf(c)) && colOk(c)) { col = c; break; }
+        if (col < 0) for (let c = 1; c < width; c++) if (colOk(c) && dataRows.some((r) => (r[c] || '') !== '')) { col = c; break; }
+        if (col >= 0) {
+          return dataRows.map((r) => ({
+            date: this._toIsoDate(r[0]),
+            count: parseInt((r[col] || '0').replace(/,/g, ''), 10) || 0
+          }));
+        }
+        /* Dated rows but no clean count column (e.g. a revenue-by-day file):
+           REJECT. Never guess a $ column, never fall through to the summary
+           shape - a wrong file must fail loudly, not save a junk row. */
+        return [];
+      }
+
+      /* Shape B: the Total Sales summary card ("2154 sales at an average
+         sale total of $31.46."), no date - a daily, yesterday-scoped
+         delivery, dated on arrival in the venue's timezone. Requires an
+         explicit sales-count match; "no sales" is a real zero day. */
+      const m = text.match(/([\d,]+)\s+sales?\b/i);
+      if (m) {
+        const count = parseInt(m[1].replace(/,/g, ''), 10);
+        if (isFinite(count)) return [{ date: this._venueYesterday(), count }];
+      }
+      if (/\bno sales\b/i.test(text)) {
+        return [{ date: this._venueYesterday(), count: 0 }];
+      }
+
+      return []; /* unrecognised file: apiIngest reports "nothing parsed" */
+    },
+
+    async status(env, h) {
+      const ls = await lastSync(env, 'pos');
+      if (!ls) return { connected: false };
+      return { connected: true, org: 'Lightspeed (daily report feed)', sandbox: false, lastSync: ls };
+    },
+
+    async fetchRange(env, h, q) {
+      const r = await h.readIngested(q.from, q.to);
+      if (!r.daysWithData) return { count: null };
+      return { count: r.sums.count || 0 };
+    },
+
+    async fetchMonthly(env, h, q) {
+      const r = await h.monthlyIngested(q.fromMonth, q.toMonth);
+      return { months: r.months, count: r.byMonth.map((m) => (m ? (m.count || 0) : null)) };
+    }
   },
 
   /* >>> ADAPTER 3: ROSTERING (optional - only if the owner has one)
@@ -720,7 +830,12 @@ async function apiIngest(env, request, url) {
   const source = url.searchParams.get('source');
   if (!['accounting', 'pos', 'rostering'].includes(source)) return json({ error: 'unknown source' }, 400);
   const auth = request.headers.get('Authorization') || '';
-  if (!env.INGEST_TOKEN || auth !== 'Bearer ' + env.INGEST_TOKEN) {
+  /* Webhook senders (e.g. Lightspeed Insights' report scheduler) cannot set an
+     Authorization header, so the same token is also accepted as ?token= in the
+     delivery URL. Both compare against the single INGEST_TOKEN secret. */
+  const qtoken = url.searchParams.get('token') || '';
+  const ok = env.INGEST_TOKEN && (auth === 'Bearer ' + env.INGEST_TOKEN || qtoken === env.INGEST_TOKEN);
+  if (!ok) {
     return json({ error: 'not authorised', plain: 'That upload code didn\u2019t match. Check it with your AI and try again.' }, 401);
   }
   const adapter = ADAPTERS[source];
