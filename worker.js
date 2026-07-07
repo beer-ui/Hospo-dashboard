@@ -470,7 +470,13 @@ function tokenRequestInit(cfg, params, env) {
 }
 
 /* Returns a valid access token for an OAuth source, refreshing (and
-   persisting the ROTATED refresh token) when needed. */
+   persisting the ROTATED refresh token) when needed.
+   COLLISION-PROOF: providers with single-use refresh tokens (Xero) revoke a
+   connection if two requests refresh with the same token, so (a) concurrent
+   callers in this isolate share ONE in-flight refresh, and (b) if a refresh
+   fails, re-read KV first - a parallel isolate may have already refreshed
+   and saved a newer token - and only then declare the connection dead. */
+const REFRESH_INFLIGHT = {};
 async function getValidAccessToken(env, source) {
   const adapter = ADAPTERS[source];
   const tokens = await getTokens(env, source);
@@ -478,27 +484,40 @@ async function getValidAccessToken(env, source) {
   const skewMs = 60 * 1000;
   if (!tokens.expires_at || Date.now() < tokens.expires_at - skewMs) return tokens.access_token;
 
-  /* refresh */
-  const cfg = adapter.oauth || {};
-  if (!tokens.refresh_token || !cfg.tokenUrl) { const e = new Error('cannot refresh'); e.status = 401; throw e; }
-  const res = await fetch(cfg.tokenUrl, tokenRequestInit(cfg, {
-    grant_type: 'refresh_token',
-    refresh_token: tokens.refresh_token
-  }, env));
-  if (!res.ok) {
-    /* refresh failed: force a reconnect rather than silently serving stale data */
-    const e = new Error('refresh failed'); e.status = 401; throw e;
-  }
-  const fresh = await res.json();
-  const updated = {
-    ...tokens,
-    access_token: fresh.access_token,
-    /* CRITICAL: many providers (Xero!) rotate the refresh token - always keep the new one */
-    refresh_token: fresh.refresh_token || tokens.refresh_token,
-    expires_at: Date.now() + ((fresh.expires_in || 1800) * 1000)
-  };
-  await saveTokens(env, source, updated);
-  return updated.access_token;
+  if (REFRESH_INFLIGHT[source]) return REFRESH_INFLIGHT[source];
+  REFRESH_INFLIGHT[source] = (async () => {
+    try {
+      /* refresh */
+      const cfg = adapter.oauth || {};
+      if (!tokens.refresh_token || !cfg.tokenUrl) { const e = new Error('cannot refresh'); e.status = 401; throw e; }
+      const res = await fetch(cfg.tokenUrl, tokenRequestInit(cfg, {
+        grant_type: 'refresh_token',
+        refresh_token: tokens.refresh_token
+      }, env));
+      if (!res.ok) {
+        /* Before giving up: another isolate may have spent this single-use
+           refresh token and saved the rotated pair. Re-read and use it. */
+        const latest = await getTokens(env, source);
+        if (latest && latest.access_token && latest.expires_at && Date.now() < latest.expires_at - skewMs) {
+          return latest.access_token;
+        }
+        const e = new Error('refresh failed'); e.status = 401; throw e;
+      }
+      const fresh = await res.json();
+      const updated = {
+        ...tokens,
+        access_token: fresh.access_token,
+        /* CRITICAL: many providers (Xero!) rotate the refresh token - always keep the new one */
+        refresh_token: fresh.refresh_token || tokens.refresh_token,
+        expires_at: Date.now() + ((fresh.expires_in || 1800) * 1000)
+      };
+      await saveTokens(env, source, updated);
+      return updated.access_token;
+    } finally {
+      delete REFRESH_INFLIGHT[source];
+    }
+  })();
+  return REFRESH_INFLIGHT[source];
 }
 
 /* Helpers handed to every adapter call */
