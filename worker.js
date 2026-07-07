@@ -460,17 +460,18 @@ const ADAPTERS = {
     async _shifts(env, startUnix, endUnix) {
       const scheds = await this._schedulers(env);
       const all = [];
-      for (const s of scheds) {
+      for (const s of scheds.slice(0, 20)) {
         const sid = s.id || s.schedulerId;
         if (!sid) continue;
-        let offset = 0;
+        let offset = 0, pages = 0;
         for (;;) {
           const data = await this._get(env,
             '/scheduler/v2/schedulers/' + sid + '/shifts?startTime=' + startUnix +
             '&endTime=' + endUnix + '&isPublished=true&limit=500&offset=' + offset);
           const shifts = (data && data.data && data.data.shifts) || [];
           all.push(...shifts);
-          if (shifts.length < 500) break;
+          pages++;
+          if (shifts.length < 500 || pages >= 10) break;
           offset = (data.paging && data.paging.offset) || (offset + 500);
         }
       }
@@ -542,7 +543,8 @@ const PLAIN_ERRORS = {
   401: 'This connection needs reconnecting. Click Reconnect and log in again.',
   403: 'This connection is missing a permission it needs. Your AI will sort out the access.',
   429: 'The tool is asking us to slow down. Wait a few minutes, then refresh.',
-  500: 'The tool had a problem at its end. Try refresh in a little while.'
+  500: 'The tool had a problem at its end. Try refresh in a little while.',
+  504: 'This tool took too long to answer and was skipped this time. The rest of the board is up to date; try refresh.'
 };
 function plainError(status) {
   return PLAIN_ERRORS[status] || ('Something went wrong talking to this tool (code ' + status + '). Try refresh; if it persists, tell your AI.');
@@ -1005,12 +1007,25 @@ function parseMonthRange(s) {
   return m ? { fromMonth: m[1], toMonth: m[2] } : null;
 }
 
+/* Race any source call against a timeout: one slow/unreachable provider must
+   never hang the whole board. On timeout the source degrades to its error
+   state (the card shows a plain "took too long" note), everything else renders. */
+function withTimeout(promise, ms, label) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => {
+      const e = new Error('timeout: ' + (label || '')); e.status = 504; reject(e);
+    }, ms))
+  ]);
+}
+const SOURCE_TIMEOUT_MS = 8000;
+
 async function sourceStatus(env, source) {
   const adapter = ADAPTERS[source];
   if (!adapter || !adapter.configured) return { configured: false };
   try {
     const h = makeHelpers(env, source);
-    const st = await adapter.status(env, h);
+    const st = await withTimeout(adapter.status(env, h), SOURCE_TIMEOUT_MS, source);
     return {
       configured: true,
       ingest: typeof adapter.parseExport === 'function',
@@ -1041,10 +1056,10 @@ async function fetchSlot(env, q) {
     if (!adapter || !adapter.configured) { out[source] = null; continue; }
     try {
       const h = makeHelpers(env, source);
-      out[source] = await adapter.fetchRange(env, h, q);
+      out[source] = await withTimeout(adapter.fetchRange(env, h, q), SOURCE_TIMEOUT_MS, source);
       await noteSync(env, source);
     } catch (err) {
-      out[source] = null; /* per-source failure never breaks the whole payload */
+      out[source] = null; /* per-source failure/timeout never breaks the whole payload */
     }
   }
   return out;
