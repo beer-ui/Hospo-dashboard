@@ -405,11 +405,127 @@ const ADAPTERS = {
      Example (Deputy): pasted permanent token (secret ROSTERING_API_TOKEN).
   */
   rostering: {
-    configured: false,
-    auth: null,
+    /* Connecteam - wired July 2026 for projected Wage % only.
+       Rostered cost = published, assigned shift hours (unpaid breaks
+       deducted) x each user's effective hourly pay rate, x 1.12 super
+       loading (SG 12%) so PROJECTED is comparable to the ACTUAL Wage %,
+       which includes super per kpi-spec.md. Secret: ROSTERING_API_TOKEN
+       (X-API-KEY header). If no pay rates are configured in Connecteam,
+       the projected card honestly shows not configured - never a $0 cost. */
+    configured: true,
+    auth: 'token',
     oauth: {},
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('rostering'); },
+    _base: 'https://api.connecteam.com',
+    _superLoading: 1.12,
+
+    async _get(env, path) {
+      const res = await fetch(this._base + path, {
+        headers: { 'X-API-KEY': env.ROSTERING_API_TOKEN || '', Accept: 'application/json' }
+      });
+      if (!res.ok) { const e = new Error('HTTP ' + res.status); e.status = res.status; throw e; }
+      return res.json();
+    },
+
+    async _schedulers(env) {
+      const data = await this._get(env, '/scheduler/v1/schedulers');
+      const list = (data && data.data && (data.data.schedulers || data.data)) || data.schedulers || [];
+      return Array.isArray(list) ? list : [];
+    },
+
+    /* userId -> hourly rate effective at `asOf` (YYYY-MM-DD). Entries are
+       effective-dated; pick the latest effectiveDate <= asOf per user. */
+    async _rateMap(env, asOf) {
+      const data = await this._get(env, '/pay-rates/v1/pay-rates');
+      const entries = (data && data.data && (data.data.payRates || data.data)) || data.payRates || [];
+      const rateOf = (e) => {
+        for (const k of ['payRate', 'hourlyRate', 'rate', 'amount', 'value']) {
+          if (typeof e[k] === 'number' && isFinite(e[k])) return e[k];
+        }
+        return null;
+      };
+      const map = {};
+      for (const e of (Array.isArray(entries) ? entries : [])) {
+        const uid = e.userId; const rate = rateOf(e);
+        if (!uid || rate == null) continue;
+        const eff = String(e.effectiveDate || '0000-00-00').slice(0, 10);
+        if (eff > asOf) continue;
+        if (!map[uid] || eff >= map[uid].eff) map[uid] = { eff, rate };
+      }
+      const out = {};
+      for (const [uid, v] of Object.entries(map)) out[uid] = v.rate;
+      return out;
+    },
+
+    /* All published shifts across all schedules, unix range, paginated. */
+    async _shifts(env, startUnix, endUnix) {
+      const scheds = await this._schedulers(env);
+      const all = [];
+      for (const s of scheds) {
+        const sid = s.id || s.schedulerId;
+        if (!sid) continue;
+        let offset = 0;
+        for (;;) {
+          const data = await this._get(env,
+            '/scheduler/v2/schedulers/' + sid + '/shifts?startTime=' + startUnix +
+            '&endTime=' + endUnix + '&isPublished=true&limit=500&offset=' + offset);
+          const shifts = (data && data.data && data.data.shifts) || [];
+          all.push(...shifts);
+          if (shifts.length < 500) break;
+          offset = (data.paging && data.paging.offset) || (offset + 500);
+        }
+      }
+      return all;
+    },
+
+    _cost(shifts, rates) {
+      let cost = 0, rated = 0, unrated = 0;
+      for (const sh of shifts) {
+        const users = sh.assignedUserIds || [];
+        if (!users.length) continue; /* unassigned/open: no committed cost */
+        let hours = (sh.endTime - sh.startTime) / 3600;
+        for (const b of (sh.breaks || [])) {
+          if (b.type === 'unpaid') hours -= (b.duration || 0) / 60;
+        }
+        if (!(hours > 0)) continue;
+        for (const uid of users) {
+          const rate = rates[uid];
+          if (rate == null) { unrated++; continue; }
+          rated++;
+          cost += hours * rate * this._superLoading;
+        }
+      }
+      return { cost, rated, unrated };
+    },
+
+    async status(env, h) {
+      if (!env.ROSTERING_API_TOKEN) return { connected: false };
+      try {
+        const scheds = await this._schedulers(env);
+        if (!scheds.length) return { connected: false, error: 'Connected, but no schedule was found in this Connecteam account.' };
+        await h.noteSync();
+        return {
+          connected: true,
+          org: 'Connecteam: ' + (scheds[0].name || scheds[0].title || 'schedule') + (scheds.length > 1 ? ' +' + (scheds.length - 1) + ' more' : ''),
+          sandbox: false,
+          lastSync: await lastSync(env, 'rostering')
+        };
+      } catch (e) {
+        return { connected: false, error: plainError(e.status || 500) };
+      }
+    },
+
+    async fetchRange(env, h, q) {
+      /* Venue-local range -> unix. Brisbane is UTC+10, no DST. */
+      const startUnix = Math.floor(Date.parse(q.from + 'T00:00:00+10:00') / 1000);
+      const endUnix = Math.floor(Date.parse(q.to + 'T23:59:59+10:00') / 1000);
+      const [shifts, rates] = [await this._shifts(env, startUnix, endUnix), await this._rateMap(env, q.to)];
+      if (!Object.keys(rates).length) throw new NotConfigured('rostering'); /* no pay rates set up: never fake a $0 */
+      const r = this._cost(shifts, rates);
+      if (r.rated === 0 && r.unrated > 0) throw new NotConfigured('rostering');
+      await h.noteSync();
+      return { cost: r.cost };
+    },
+
     async fetchMonthly(env, h, q) { return { months: [], cost: [] }; }
   }
 };
