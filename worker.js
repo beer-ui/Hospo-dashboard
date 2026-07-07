@@ -127,8 +127,12 @@ const ADAPTERS = {
       const n = parseFloat(String(v == null ? '' : v).replace(/,/g, ''));
       return isFinite(n) ? n : 0;
     },
+    /* Owner-confirmed wage/super accounts (reconciliation, 7 Jul 2026).
+       Exact labels only - a new payroll-ish account never silently joins
+       Wage % without the owner re-confirming here. */
+    _wageLabels: ['wages and salaries', 'superannuation'],
     _isWageLine(label) {
-      return /\b(wages?|salar(y|ies)|superannuation|super|payroll|annual leave|long service|workcover)\b/i.test(label || '');
+      return this._wageLabels.includes(String(label || '').trim().toLowerCase());
     },
     _sectionKind(title) {
       const s = (title || '').trim();
