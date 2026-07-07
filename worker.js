@@ -79,22 +79,184 @@ const ADAPTERS = {
      'Demo Company'. Secrets: ACCOUNTING_CLIENT_ID, ACCOUNTING_CLIENT_SECRET.
   */
   accounting: {
-    configured: false,
-    auth: null, /* 'oauth' | 'token' */
+    /* Xero - wired July 2026 for Future Magic Brewing Co.
+       Money per kpi-spec.md: Revenue = trading Income section (Other Income
+       excluded); COGS = Cost of Sales section; wagesSuper = keyword-matched
+       lines inside Operating Expenses (owner confirms the list at
+       reconciliation); Overheads = Operating Expenses total minus wagesSuper.
+       All figures from the Xero P&L report (ex GST by report design). */
+    configured: true,
+    auth: 'oauth',
     oauth: {
-      /* Example (Xero) - fill these when you wire the adapter:
-         authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
-         tokenUrl: 'https://identity.xero.com/connect/token',
-         scopes: 'offline_access accounting.reports.profitandloss.read',
-         clientIdSecret: 'ACCOUNTING_CLIENT_ID',
-         clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
-         tokenAuth: 'basic'   // Xero's token endpoint wants HTTP Basic client auth
-                              // (client_secret_basic). Use 'post' only for providers
-                              // that expect client_id/secret in the form body. */
+      authorizeUrl: 'https://login.xero.com/identity/connect/authorize',
+      tokenUrl: 'https://identity.xero.com/connect/token',
+      scopes: 'offline_access accounting.reports.profitandloss.read',
+      clientIdSecret: 'ACCOUNTING_CLIENT_ID',
+      clientSecretSecret: 'ACCOUNTING_CLIENT_SECRET',
+      tokenAuth: 'basic' /* Xero token endpoint requires client_secret_basic */
     },
-    async status(env, h) { return { connected: false }; },
-    async fetchRange(env, h, q) { throw new NotConfigured('accounting'); },
-    async fetchMonthly(env, h, q) { throw new NotConfigured('accounting'); }
+
+    /* Resolve (and cache) the Xero tenant. */
+    async _tenant(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens) { const e = new Error('no tokens'); e.status = 401; throw e; }
+      if (tokens.tenantId) return { id: tokens.tenantId, name: tokens.tenantName || '' };
+      const conns = await h.fetchJson('https://api.xero.com/connections', {
+        headers: { Accept: 'application/json' }
+      });
+      const org = (conns || []).find((c) => (c.tenantType || '') === 'ORGANISATION') || (conns || [])[0];
+      if (!org) { const e = new Error('no organisation connected'); e.status = 401; throw e; }
+      const fresh = await h.getTokens();
+      await h.saveTokens({ ...fresh, tenantId: org.tenantId, tenantName: org.tenantName || '' });
+      return { id: org.tenantId, name: org.tenantName || '' };
+    },
+
+    async _pnl(env, h, params) {
+      const t = await this._tenant(env, h);
+      const u = new URL('https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss');
+      for (const [k, v] of Object.entries(params)) u.searchParams.set(k, v);
+      const data = await h.fetchJson(u.toString(), {
+        headers: { 'Xero-Tenant-Id': t.id, Accept: 'application/json' }
+      });
+      await h.noteSync();
+      return (data.Reports && data.Reports[0]) || { Rows: [] };
+    },
+
+    /* --- P&L walking, shared by fetchRange and fetchMonthly --- */
+    _num(v) {
+      const n = parseFloat(String(v == null ? '' : v).replace(/,/g, ''));
+      return isFinite(n) ? n : 0;
+    },
+    _isWageLine(label) {
+      return /\b(wages?|salar(y|ies)|superannuation|super|payroll|annual leave|long service|workcover)\b/i.test(label || '');
+    },
+    _sectionKind(title) {
+      const s = (title || '').trim();
+      if (/other income/i.test(s)) return 'otherIncome';           /* excluded */
+      if (/^(trading\s+)?(income|revenue)$/i.test(s)) return 'income';
+      if (/^(less\s+)?cost of (sales|goods)/i.test(s)) return 'cogs';
+      if (/^(less\s+)?(operating\s+)?expenses$/i.test(s)) return 'opex';
+      return null;
+    },
+    /* Walk one report. nCols = number of amount columns (1 for a range pull,
+       one per month for a multi-period pull). Returns per-column
+       { revenue, cogs, wagesSuper, overheads } plus the matched wage labels. */
+    _walk(report, nCols) {
+      const zero = () => new Array(nCols).fill(0);
+      const out = { revenue: zero(), cogs: zero(), opexTotal: zero(), wagesSuper: zero(), wageLabels: [] };
+      const rowsOf = (sec) => (sec && sec.Rows) || [];
+      const amounts = (cells) => {
+        const a = [];
+        for (let i = 1; i <= nCols; i++) a.push(this._num(cells && cells[i] && cells[i].Value));
+        return a;
+      };
+      for (const sec of (report.Rows || [])) {
+        if (sec.RowType !== 'Section') continue;
+        const kind = this._sectionKind(sec.Title);
+        if (!kind || kind === 'otherIncome') continue;
+        let summary = null;
+        let rowSum = zero();
+        for (const row of rowsOf(sec)) {
+          if (row.RowType === 'SummaryRow') { summary = amounts(row.Cells); continue; }
+          if (row.RowType !== 'Row') continue;
+          const label = row.Cells && row.Cells[0] && row.Cells[0].Value;
+          const vals = amounts(row.Cells);
+          rowSum = rowSum.map((x, i) => x + vals[i]);
+          if (kind === 'opex' && this._isWageLine(label)) {
+            out.wageLabels.push(label);
+            out.wagesSuper = out.wagesSuper.map((x, i) => x + vals[i]);
+          }
+        }
+        const total = summary || rowSum;
+        if (kind === 'income') out.revenue = out.revenue.map((x, i) => x + total[i]);
+        if (kind === 'cogs') out.cogs = out.cogs.map((x, i) => x + total[i]);
+        if (kind === 'opex') out.opexTotal = out.opexTotal.map((x, i) => x + total[i]);
+      }
+      out.overheads = out.opexTotal.map((x, i) => x - out.wagesSuper[i]);
+      return out;
+    },
+
+    async status(env, h) {
+      const tokens = await h.getTokens();
+      if (!tokens || !tokens.access_token) return { connected: false };
+      try {
+        const t = await this._tenant(env, h);
+        return {
+          connected: true,
+          org: t.name,
+          sandbox: /demo company/i.test(t.name),
+          lastSync: await lastSync(env, 'accounting')
+        };
+      } catch (e) {
+        return { connected: false, error: plainError(e.status || 500) };
+      }
+    },
+
+    /* Single explicit range -> one-column report. */
+    async fetchRange(env, h, q) {
+      const report = await this._pnl(env, h, { fromDate: q.from, toDate: q.to });
+      const w = this._walk(report, 1);
+      return { revenue: w.revenue[0], cogs: w.cogs[0], wagesSuper: w.wagesSuper[0], overheads: w.overheads[0] };
+    },
+
+    /* Monthly trend. Xero caps `periods` at 12, so pull in <=12-month blocks
+       (timeframe=MONTH) and map columns to months via the report header row -
+       Xero orders period columns newest-first, so never assume order. */
+    async fetchMonthly(env, h, q) {
+      const months = [];
+      { /* enumerate q.fromMonth..q.toMonth inclusive (YYYY-MM) */
+        let [y, m] = q.fromMonth.split('-').map(Number);
+        const [ey, em] = q.toMonth.split('-').map(Number);
+        while (y < ey || (y === ey && m <= em)) {
+          months.push(y + '-' + String(m).padStart(2, '0'));
+          m++; if (m > 12) { m = 1; y++; }
+        }
+      }
+      const byMonth = {};
+      const MONTHS_ABBR = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+      for (let i = 0; i < months.length; i += 12) {
+        const block = months.slice(i, i + 12);
+        const last = block[block.length - 1];
+        const [ly, lm] = last.split('-').map(Number);
+        const lastDay = new Date(Date.UTC(ly, lm, 0)).getUTCDate();
+        const report = await this._pnl(env, h, {
+          fromDate: block[0] + '-01',
+          toDate: last + '-' + String(lastDay).padStart(2, '0'),
+          periods: String(block.length),
+          timeframe: 'MONTH'
+        });
+        /* Header row cells (after the first) title each period column, e.g.
+           "31 Jul 25" or "Jul-25"; parse each to YYYY-MM. */
+        const header = (report.Rows || []).find((r) => r.RowType === 'Header');
+        const colMonths = [];
+        if (header && header.Cells) {
+          for (let c = 1; c < header.Cells.length; c++) {
+            const txt = String(header.Cells[c].Value || '');
+            const m1 = txt.match(/([A-Za-z]{3})[a-z]*[\s-]+('?\d{2}|\d{4})/);
+            if (m1 && MONTHS_ABBR[m1[1].toLowerCase()]) {
+              let yy = m1[2].replace("'", '');
+              if (yy.length === 2) yy = '20' + yy;
+              colMonths.push(yy + '-' + String(MONTHS_ABBR[m1[1].toLowerCase()]).padStart(2, '0'));
+            } else colMonths.push(null);
+          }
+        }
+        const nCols = colMonths.length || block.length;
+        const w = this._walk(report, nCols);
+        for (let c = 0; c < nCols; c++) {
+          /* Fall back to newest-first order if a header cell didn't parse */
+          const mo = colMonths[c] || block[block.length - 1 - c];
+          if (!mo) continue;
+          byMonth[mo] = { revenue: w.revenue[c], cogs: w.cogs[c], wagesSuper: w.wagesSuper[c], overheads: w.overheads[c] };
+        }
+      }
+      return {
+        months,
+        revenue: months.map((m) => (byMonth[m] ? byMonth[m].revenue : null)),
+        cogs: months.map((m) => (byMonth[m] ? byMonth[m].cogs : null)),
+        wagesSuper: months.map((m) => (byMonth[m] ? byMonth[m].wagesSuper : null)),
+        overheads: months.map((m) => (byMonth[m] ? byMonth[m].overheads : null))
+      };
+    }
   },
 
   /* >>> ADAPTER 2: POS
